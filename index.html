@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-C3 RGB 控制台</title>
+<script src="./lib/mqtt.min.js"></script>
+<script src="./lib/iro.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #1e1f24;
+    color: #e8e8ea;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 12px 48px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+  .card {
+    background: #2a2b31;
+    border-radius: 12px;
+    padding: 20px;
+    width: 100%;
+    max-width: 420px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: #9d9da6; font-weight: 600; }
+  label { display: block; font-size: 13px; color: #9d9da6; margin: 10px 0 4px; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #44454d;
+    border-radius: 8px;
+    background: #1e1f24;
+    color: #e8e8ea;
+    font-size: 14px;
+  }
+  input:focus { outline: none; border-color: #6c8cff; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    margin-top: 14px;
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    background: #6c8cff;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  button:hover { background: #5a79e8; }
+  button:disabled { background: #44454d; cursor: not-allowed; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    margin-top: 10px;
+    color: #9d9da6;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; }
+  .dot.connecting { background: #e8b34b; }
+  .dot.connected { background: #4bc86b; }
+  .dot.error { background: #e05555; }
+  #picker { display: flex; justify-content: center; margin: 8px 0 4px; }
+  input[type=range] { width: 100%; margin-top: 6px; accent-color: #6c8cff; }
+  .value-line { font-size: 13px; color: #9d9da6; margin-top: 8px; font-family: Consolas, monospace; }
+  #swatch {
+    width: 100%;
+    height: 36px;
+    border-radius: 8px;
+    margin-top: 12px;
+    border: 1px solid #44454d;
+  }
+  .hint { font-size: 12px; color: #6f7079; margin-top: 10px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<h1>ESP32-C3 RGB 控制台</h1>
+
+<div class="card">
+  <h2>MQTT 连接设置(EMQX Cloud)</h2>
+  <label>主机(连接地址,不含协议和端口)</label>
+  <input type="text" id="host" placeholder="例如 abc123.ala.cn-hangzhou.emqxsl.cn">
+  <div class="row">
+    <div>
+      <label>WSS 端口</label>
+      <input type="number" id="port" value="8084">
+    </div>
+    <div>
+      <label>路径</label>
+      <input type="text" id="path" value="/mqtt">
+    </div>
+  </div>
+  <label>用户名</label>
+  <input type="text" id="username" placeholder="EMQX 认证管理里创建的用户名">
+  <label>密码</label>
+  <input type="password" id="password" placeholder="EMQX 认证管理里创建的密码">
+  <button id="connectBtn">连接</button>
+  <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">未连接</span></div>
+  <div class="hint">参数会保存在浏览器 localStorage,刷新后自动填充。<br>注意:这里的用户名/密码是在 EMQX Cloud 部署的「认证管理」中创建的 MQTT 凭证,不是 App ID / App Secret。</div>
+</div>
+
+<div class="card">
+  <h2>颜色与亮度</h2>
+  <div id="picker"></div>
+  <label>亮度 <span id="brightnessVal">100</span>%</label>
+  <input type="range" id="brightness" min="0" max="100" value="100">
+  <div id="swatch" style="background: rgb(255,255,255)"></div>
+  <div class="value-line" id="valueLine">r=255 g=255 b=255 brightness=100</div>
+</div>
+
+<script>
+const TOPIC_SET   = "esp32c3/rgb/set";
+const TOPIC_STATE = "esp32c3/rgb/state";
+
+// 手机端没有开发者工具,把 JS 错误直接显示在状态栏里方便排查
+window.addEventListener("error", (e) => {
+  const el = document.getElementById("statusText");
+  if (el) el.textContent = "脚本错误: " + e.message;
+});
+
+const els = {
+  host: document.getElementById("host"),
+  port: document.getElementById("port"),
+  path: document.getElementById("path"),
+  username: document.getElementById("username"),
+  password: document.getElementById("password"),
+  connectBtn: document.getElementById("connectBtn"),
+  statusDot: document.getElementById("statusDot"),
+  statusText: document.getElementById("statusText"),
+  brightness: document.getElementById("brightness"),
+  brightnessVal: document.getElementById("brightnessVal"),
+  swatch: document.getElementById("swatch"),
+  valueLine: document.getElementById("valueLine"),
+};
+
+// ---------- 连接设置的保存与恢复 ----------
+const SETTINGS_KEY = "esp32c3-mqtt-settings";
+function saveSettings() {
+  try {
+    const s = {
+      host: els.host.value.trim(),
+      port: els.port.value.trim(),
+      path: els.path.value.trim(),
+      username: els.username.value,
+      password: els.password.value,
+    };
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  } catch (e) { /* 部分手机浏览器 file:// 下禁用 localStorage,忽略即可 */ }
+}
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    if (s.host) els.host.value = s.host;
+    if (s.port) els.port.value = s.port;
+    if (s.path) els.path.value = s.path;
+    if (s.username) els.username.value = s.username;
+    if (s.password) els.password.value = s.password;
+  } catch (e) { /* 忽略损坏的缓存 */ }
+}
+loadSettings();
+
+// ---------- 色圈 ----------
+const colorPicker = new iro.ColorPicker("#picker", {
+  width: 220,
+  color: "#ffffff",
+  layout: [
+    { component: iro.ui.Wheel },
+    { component: iro.ui.Slider, options: { sliderType: "value" } },
+  ],
+});
+
+// ---------- 状态显示 ----------
+function setStatus(text, cls) {
+  els.statusText.textContent = text;
+  els.statusDot.className = "dot" + (cls ? " " + cls : "");
+}
+
+// ---------- MQTT ----------
+let client = null;
+let applyingRemote = false; // 回传状态更新界面时不触发再次发布
+let publishTimer = null;
+
+function currentPayload() {
+  const c = colorPicker.color;
+  return {
+    r: Math.round(c.red),
+    g: Math.round(c.green),
+    b: Math.round(c.blue),
+    brightness: parseInt(els.brightness.value, 10),
+  };
+}
+
+function refreshPreview() {
+  const p = currentPayload();
+  const scale = p.brightness / 100;
+  const r = Math.round(p.r * scale), g = Math.round(p.g * scale), b = Math.round(p.b * scale);
+  els.swatch.style.background = `rgb(${r},${g},${b})`;
+  els.valueLine.textContent = `r=${p.r} g=${p.g} b=${p.b} brightness=${p.brightness}`;
+  els.brightnessVal.textContent = p.brightness;
+}
+
+function schedulePublish() {
+  if (applyingRemote) return;
+  refreshPreview();
+  if (!client || !client.connected) return;
+  if (publishTimer) clearTimeout(publishTimer);
+  publishTimer = setTimeout(() => {
+    client.publish(TOPIC_SET, JSON.stringify(currentPayload()), { qos: 1 });
+  }, 50);
+}
+
+colorPicker.on("color:change", schedulePublish);
+els.brightness.addEventListener("input", schedulePublish);
+refreshPreview();
+
+function applyState(msg) {
+  applyingRemote = true;
+  try {
+    const hex = iro.Color.rgbToHex({ r: msg.r, g: msg.g, b: msg.b });
+    colorPicker.color.set(hex);
+    if (typeof msg.brightness === "number") {
+      els.brightness.value = Math.max(0, Math.min(100, Math.round(msg.brightness)));
+    }
+  } catch (e) { /* 忽略非法状态 */ }
+  applyingRemote = false;
+  refreshPreview();
+}
+
+function disconnect() {
+  if (client) {
+    client.end(true);
+    client = null;
+  }
+  setStatus("未连接", "");
+  els.connectBtn.textContent = "连接";
+}
+
+els.connectBtn.addEventListener("click", () => {
+  if (client) {
+    disconnect();
+    return;
+  }
+  const host = els.host.value.trim();
+  if (!host) {
+    setStatus("请填写主机地址", "error");
+    return;
+  }
+  saveSettings();
+
+  const url = `wss://${host}:${els.port.value.trim() || "8084"}${els.path.value.trim() || "/mqtt"}`;
+  setStatus("连接中...", "connecting");
+
+  client = mqtt.connect(url, {
+    username: els.username.value,
+    password: els.password.value,
+    clientId: "web-" + Math.random().toString(16).slice(2, 10),
+    keepalive: 30,
+    reconnectPeriod: 3000,
+    connectTimeout: 8000,
+  });
+
+  client.on("connect", () => {
+    setStatus("已连接", "connected");
+    els.connectBtn.textContent = "断开";
+    client.subscribe(TOPIC_STATE, { qos: 1 });
+  });
+  client.on("message", (topic, payload) => {
+    if (topic === TOPIC_STATE) {
+      try {
+        applyState(JSON.parse(payload.toString()));
+      } catch (e) { /* 忽略非法 JSON */ }
+    }
+  });
+  client.on("reconnect", () => setStatus("重连中...", "connecting"));
+  client.on("close", () => {
+    if (client) setStatus("连接已断开", "error");
+  });
+  client.on("error", (err) => {
+    setStatus("连接错误:" + err.message, "error");
+  });
+});
+</script>
+
+</body>
+</html>
