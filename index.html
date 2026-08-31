@@ -62,7 +62,7 @@
     margin-top: 10px;
     color: #9d9da6;
   }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
   .dot.connecting { background: #e8b34b; }
   .dot.connected { background: #4bc86b; }
   .dot.error { background: #e05555; }
@@ -77,11 +77,40 @@
     border: 1px solid #44454d;
   }
   .hint { font-size: 12px; color: #6f7079; margin-top: 10px; line-height: 1.6; }
+  .channel-badge {
+    display: inline-block;
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #44454d;
+    color: #9d9da6;
+    margin-left: 6px;
+  }
+  .channel-badge.mqtt { background: #24427a; color: #9db9ff; }
+  .channel-badge.ble { background: #2a5a34; color: #9fe8b0; }
+  .device-line { font-size: 13px; color: #9d9da6; margin-top: 10px; }
 </style>
 </head>
 <body>
 
 <h1>ESP32-C3 RGB 控制台</h1>
+
+<div class="card">
+  <h2>蓝牙直连(配网 / MQTT 断开时的备用通道)</h2>
+  <button id="bleBtn">连接蓝牙</button>
+  <div class="status"><span class="dot" id="bleDot"></span><span id="bleText">未连接</span></div>
+  <div id="bleUnsupported" class="hint" style="display:none">当前浏览器不支持网页蓝牙,请用电脑版或安卓版 Chrome / Edge 打开(iOS Safari 不支持,只能用 MQTT)。</div>
+  <div id="wifiForm" style="display:none">
+    <label>Wi-Fi 名称(SSID,2.4 GHz)</label>
+    <input type="text" id="ssid" placeholder="家里路由器的 Wi-Fi 名">
+    <label>Wi-Fi 密码</label>
+    <input type="password" id="wifiPassword">
+    <button id="sendWifiBtn">发送配网信息</button>
+    <div class="device-line">设备 Wi-Fi:<span class="dot" id="devWifiDot"></span>
+      &nbsp;设备 MQTT:<span class="dot" id="devMqttDot"></span></div>
+  </div>
+  <div class="hint">首次使用:点「连接蓝牙」选 ESP32C3-RGB,填 Wi-Fi 名称密码发送,设备 Wi-Fi 指示灯变绿即配网成功。Wi-Fi 凭证会保存在设备里,重启自动重连。</div>
+</div>
 
 <div class="card">
   <h2>MQTT 连接设置(EMQX Cloud)</h2>
@@ -107,7 +136,7 @@
 </div>
 
 <div class="card">
-  <h2>颜色与亮度</h2>
+  <h2>颜色与亮度<span class="channel-badge" id="channelBadge">无连接</span></h2>
   <div id="picker"></div>
   <label>亮度 <span id="brightnessVal">100</span>%</label>
   <input type="range" id="brightness" min="0" max="100" value="100">
@@ -118,6 +147,11 @@
 <script>
 const TOPIC_SET   = "esp32c3/rgb/set";
 const TOPIC_STATE = "esp32c3/rgb/state";
+
+const BLE_SERVICE   = "12345678-1234-5678-1234-56789abcdef0";
+const BLE_CHR_WIFI  = "12345678-1234-5678-1234-56789abcdef1";
+const BLE_CHR_RGB   = "12345678-1234-5678-1234-56789abcdef2";
+const BLE_CHR_STATE = "12345678-1234-5678-1234-56789abcdef3";
 
 // 手机端没有开发者工具,把 JS 错误直接显示在状态栏里方便排查
 window.addEventListener("error", (e) => {
@@ -138,6 +172,17 @@ const els = {
   brightnessVal: document.getElementById("brightnessVal"),
   swatch: document.getElementById("swatch"),
   valueLine: document.getElementById("valueLine"),
+  bleBtn: document.getElementById("bleBtn"),
+  bleDot: document.getElementById("bleDot"),
+  bleText: document.getElementById("bleText"),
+  bleUnsupported: document.getElementById("bleUnsupported"),
+  wifiForm: document.getElementById("wifiForm"),
+  ssid: document.getElementById("ssid"),
+  wifiPassword: document.getElementById("wifiPassword"),
+  sendWifiBtn: document.getElementById("sendWifiBtn"),
+  devWifiDot: document.getElementById("devWifiDot"),
+  devMqttDot: document.getElementById("devMqttDot"),
+  channelBadge: document.getElementById("channelBadge"),
 };
 
 // ---------- 连接设置的保存与恢复 ----------
@@ -152,7 +197,7 @@ function saveSettings() {
       password: els.password.value,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  } catch (e) { /* 部分手机浏览器 file:// 下禁用 localStorage,忽略即可 */ }
+  } catch (e) { /* 部分手机浏览器禁用 localStorage,忽略即可 */ }
 }
 function loadSettings() {
   try {
@@ -180,6 +225,22 @@ const colorPicker = new iro.ColorPicker("#picker", {
 function setStatus(text, cls) {
   els.statusText.textContent = text;
   els.statusDot.className = "dot" + (cls ? " " + cls : "");
+}
+function setBleStatus(text, cls) {
+  els.bleText.textContent = text;
+  els.bleDot.className = "dot" + (cls ? " " + cls : "");
+}
+function updateChannelBadge() {
+  if (client && client.connected) {
+    els.channelBadge.textContent = "MQTT 通道";
+    els.channelBadge.className = "channel-badge mqtt";
+  } else if (bleRgbChr) {
+    els.channelBadge.textContent = "蓝牙通道";
+    els.channelBadge.className = "channel-badge ble";
+  } else {
+    els.channelBadge.textContent = "无连接";
+    els.channelBadge.className = "channel-badge";
+  }
 }
 
 // ---------- MQTT ----------
@@ -209,10 +270,15 @@ function refreshPreview() {
 function schedulePublish() {
   if (applyingRemote) return;
   refreshPreview();
-  if (!client || !client.connected) return;
   if (publishTimer) clearTimeout(publishTimer);
   publishTimer = setTimeout(() => {
-    client.publish(TOPIC_SET, JSON.stringify(currentPayload()), { qos: 1 });
+    const payload = JSON.stringify(currentPayload());
+    if (client && client.connected) {
+      client.publish(TOPIC_SET, payload, { qos: 1 });
+    } else if (bleRgbChr) {
+      bleRgbChr.writeValueWithoutResponse(new TextEncoder().encode(payload))
+        .catch((e) => console.warn("BLE write failed", e));
+    }
   }, 50);
 }
 
@@ -230,21 +296,28 @@ function applyState(msg) {
     }
   } catch (e) { /* 忽略非法状态 */ }
   applyingRemote = false;
+  if (typeof msg.wifi === "boolean") {
+    els.devWifiDot.className = "dot" + (msg.wifi ? " connected" : "");
+  }
+  if (typeof msg.mqtt === "boolean") {
+    els.devMqttDot.className = "dot" + (msg.mqtt ? " connected" : "");
+  }
   refreshPreview();
 }
 
-function disconnect() {
+function disconnectMqtt() {
   if (client) {
     client.end(true);
     client = null;
   }
   setStatus("未连接", "");
   els.connectBtn.textContent = "连接";
+  updateChannelBadge();
 }
 
 els.connectBtn.addEventListener("click", () => {
   if (client) {
-    disconnect();
+    disconnectMqtt();
     return;
   }
   const host = els.host.value.trim();
@@ -270,6 +343,7 @@ els.connectBtn.addEventListener("click", () => {
     setStatus("已连接", "connected");
     els.connectBtn.textContent = "断开";
     client.subscribe(TOPIC_STATE, { qos: 1 });
+    updateChannelBadge();
   });
   client.on("message", (topic, payload) => {
     if (topic === TOPIC_STATE) {
@@ -278,14 +352,95 @@ els.connectBtn.addEventListener("click", () => {
       } catch (e) { /* 忽略非法 JSON */ }
     }
   });
-  client.on("reconnect", () => setStatus("重连中...", "connecting"));
+  client.on("reconnect", () => { setStatus("重连中...", "connecting"); updateChannelBadge(); });
   client.on("close", () => {
-    if (client) setStatus("连接已断开", "error");
+    if (client) { setStatus("连接已断开", "error"); updateChannelBadge(); }
   });
   client.on("error", (err) => {
     setStatus("连接错误:" + err.message, "error");
   });
 });
+
+// ---------- 蓝牙(Web Bluetooth) ----------
+let bleDevice = null;
+let bleRgbChr = null;
+let bleWifiChr = null;
+
+function onBleDisconnected() {
+  bleRgbChr = null;
+  bleWifiChr = null;
+  setBleStatus("未连接", "");
+  els.bleBtn.textContent = "连接蓝牙";
+  els.wifiForm.style.display = "none";
+  updateChannelBadge();
+}
+
+els.bleBtn.addEventListener("click", async () => {
+  if (bleDevice && bleDevice.gatt.connected) {
+    bleDevice.gatt.disconnect();
+    return;
+  }
+  if (!navigator.bluetooth) {
+    els.bleUnsupported.style.display = "block";
+    return;
+  }
+  try {
+    setBleStatus("搜索设备...", "connecting");
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "ESP32C3-RGB" }],
+      optionalServices: [BLE_SERVICE],
+    });
+    bleDevice.addEventListener("gattserverdisconnected", onBleDisconnected);
+
+    setBleStatus("连接中...", "connecting");
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(BLE_SERVICE);
+    bleRgbChr = await service.getCharacteristic(BLE_CHR_RGB);
+    bleWifiChr = await service.getCharacteristic(BLE_CHR_WIFI);
+    const stateChr = await service.getCharacteristic(BLE_CHR_STATE);
+    await stateChr.startNotifications();
+    stateChr.addEventListener("characteristicvaluechanged", (e) => {
+      try {
+        applyState(JSON.parse(new TextDecoder().decode(e.target.value)));
+      } catch (err) { /* 忽略非法状态 */ }
+    });
+    // 主动读一次当前状态
+    const value = await stateChr.readValue();
+    applyState(JSON.parse(new TextDecoder().decode(value)));
+
+    setBleStatus("已连接 " + (bleDevice.name || "ESP32C3-RGB"), "connected");
+    els.bleBtn.textContent = "断开蓝牙";
+    els.wifiForm.style.display = "block";
+    updateChannelBadge();
+  } catch (e) {
+    setBleStatus("连接失败: " + e.message, "error");
+    onBleDisconnected();
+  }
+});
+
+els.sendWifiBtn.addEventListener("click", async () => {
+  if (!bleWifiChr) {
+    setBleStatus("请先连接蓝牙", "error");
+    return;
+  }
+  const ssid = els.ssid.value.trim();
+  if (!ssid) {
+    setBleStatus("请填写 Wi-Fi 名称", "error");
+    return;
+  }
+  try {
+    const payload = JSON.stringify({ ssid: ssid, password: els.wifiPassword.value });
+    await bleWifiChr.writeValue(new TextEncoder().encode(payload));
+    setBleStatus("配网信息已发送,等待设备联网...", "connecting");
+  } catch (e) {
+    setBleStatus("发送失败: " + e.message, "error");
+  }
+});
+
+if (!navigator.bluetooth) {
+  els.bleUnsupported.style.display = "block";
+}
+updateChannelBadge();
 </script>
 
 </body>
