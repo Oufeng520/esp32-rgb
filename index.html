@@ -289,7 +289,7 @@ refreshPreview();
 function applyState(msg) {
   applyingRemote = true;
   try {
-    const hex = iro.Color.rgbToHex({ r: msg.r, g: msg.g, b: msg.b });
+    const hex = new iro.Color({ r: msg.r, g: msg.g, b: msg.b }).hexString;
     colorPicker.color.set(hex);
     if (typeof msg.brightness === "number") {
       els.brightness.value = Math.max(0, Math.min(100, Math.round(msg.brightness)));
